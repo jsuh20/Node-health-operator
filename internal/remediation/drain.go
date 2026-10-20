@@ -54,7 +54,7 @@ func (d *Drainer) Drain(ctx context.Context, node *corev1.Node) (DrainResult, er
 		return res, fmt.Errorf("list pods on %s: %w", node.Name, err)
 	}
 
-	reachable := nodeReady(node)
+	reachable := NodeReady(node)
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 
@@ -110,7 +110,8 @@ func skipForDrain(pod *corev1.Pod) bool {
 	return false
 }
 
-func nodeReady(node *corev1.Node) bool {
+// NodeReady reports whether the node's Ready condition is True.
+func NodeReady(node *corev1.Node) bool {
 	for _, c := range node.Status.Conditions {
 		if c.Type == corev1.NodeReady {
 			return c.Status == corev1.ConditionTrue

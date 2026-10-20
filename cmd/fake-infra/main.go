@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/jsuh20/node-health-operator/api/v1alpha1"
 	"github.com/jsuh20/node-health-operator/internal/remediation"
 )
 
@@ -61,6 +62,9 @@ func main() {
 
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		log.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
 		log.Fatal(err)
 	}
 	c, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
@@ -141,13 +145,16 @@ func (f *infra) carryOut(ctx context.Context, node, req string) {
 	started := time.Now()
 
 	if f.useDocker {
+		before := f.readyHeartbeat(ctx, node)
 		if out, err := exec.CommandContext(ctx, "docker", "restart", node).CombinedOutput(); err != nil {
 			log.Printf("%s: docker restart failed: %v: %s", node, err, out)
 			return // the operator's rebootTimeout will turn this into a failed attempt
 		}
 		// Only a heartbeat sent AFTER the restart proves the kubelet came back.
-		// (Heartbeats have 1s resolution, hence the extra second.)
-		if err := f.waitForFreshReady(ctx, node, time.Now().Add(time.Second)); err != nil {
+		// We wait for one newer than the last pre-restart heartbeat. Comparing
+		// against this machine's clock instead broke in testing: heartbeats are
+		// stamped by the node's (Docker VM's) clock, which can lag ours.
+		if err := f.waitForFreshReady(ctx, node, before); err != nil {
 			log.Printf("%s: did not come back: %v", node, err)
 			return
 		}
@@ -180,8 +187,19 @@ func (f *infra) carryOut(ctx context.Context, node, req string) {
 	log.Printf("%s: %s done in %s (sticky fault kept: %v)", node, req, time.Since(started).Round(time.Second), sticky && !replace)
 }
 
-// waitForFreshReady waits until the kubelet has posted Ready=True after
-// `since`, i.e. the node really came back from the restart.
+// readyHeartbeat returns the node's latest Ready heartbeat time.
+func (f *infra) readyHeartbeat(ctx context.Context, node string) time.Time {
+	var n corev1.Node
+	if err := f.c.Get(ctx, client.ObjectKey{Name: node}, &n); err == nil {
+		if c := findCondition(&n, corev1.NodeReady); c != nil {
+			return c.LastHeartbeatTime.Time
+		}
+	}
+	return time.Time{}
+}
+
+// waitForFreshReady waits until the kubelet has posted Ready=True with a
+// heartbeat newer than `since`, i.e. the node really came back.
 func (f *infra) waitForFreshReady(ctx context.Context, node string, since time.Time) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()

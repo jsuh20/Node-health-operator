@@ -31,5 +31,11 @@ metadata:
   namespace: default
 spec:
   maxUnavailable: 1
+  # Without this, a dead node deadlocks its own drain: its pods go NotReady,
+  # the budget counts them as already disrupted, and the default policy
+  # (IfHealthyBudget) then refuses to evict even those dead pods. AlwaysAllow
+  # lets pods that are already unhealthy be evicted; healthy pods stay
+  # protected. (Found by chaos scenario 3.)
+  unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels: {app: training-job}

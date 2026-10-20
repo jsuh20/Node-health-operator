@@ -344,10 +344,19 @@ func (r *RemediationPolicyReconciler) advance(ctx context.Context, policy *v1alp
 		msg := fmt.Sprintf("%d pods left", res.Remaining)
 		if res.BlockedByPDB > 0 {
 			msg += fmt.Sprintf(", %d blocked by PodDisruptionBudget", res.BlockedByPDB)
+			hint := ""
+			if !remediation.NodeReady(node) {
+				// The node is down, so its pods are already NotReady. A PDB with the
+				// default unhealthyPodEvictionPolicy (IfHealthyBudget) then refuses to
+				// evict even those dead pods. Say so; we still won't bypass the PDB.
+				hint = "; node is not Ready, so these pods are likely already down. " +
+					"Consider unhealthyPodEvictionPolicy: AlwaysAllow on the PDB"
+				msg += " (node not Ready)"
+			}
 			if !strings.Contains(prevStatus(policy, node.Name).Message, "PodDisruptionBudget") {
-				log.Info("Drain blocked by PodDisruptionBudget", "blocked", res.BlockedByPDB)
+				log.Info("Drain blocked by PodDisruptionBudget", "blocked", res.BlockedByPDB, "nodeReady", hint == "")
 				r.Recorder.Eventf(node, policy, corev1.EventTypeNormal, "DrainBlockedByPDB", "Drain",
-					"%d evictions refused by PodDisruptionBudgets; retrying", res.BlockedByPDB)
+					"%d evictions refused by PodDisruptionBudgets; retrying%s", res.BlockedByPDB, hint)
 			}
 		}
 		return stateStatus(node.Name, state, msg), drainPollInterval, true, nil

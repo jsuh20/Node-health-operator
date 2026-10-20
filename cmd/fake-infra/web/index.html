@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node Health</title>
+<style>
+  :root {
+    --page: #f9f9f7; --surface: #fcfcfb; --line: #e4e3df;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --info: #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --page: #0d0d0d; --surface: #1a1a19; --line: #2e2e2c; --ink: #f0efec; --ink-2: #c3c2b7; --info: #3987e5; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 28px 0 10px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .policies { display: grid; gap: 12px; margin-top: 16px; }
+  .policy { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; align-items: end; }
+  .kpi .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .kpi .l { color: var(--ink-2); font-size: 12px; }
+  .meter { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; margin-top: 6px; }
+  .meter > div { height: 100%; border-radius: 4px; transition: width .3s; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+  .tile { border-left: 5px solid var(--c); display: flex; flex-direction: column; gap: 8px; }
+  .tile .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .name { font-weight: 600; font-family: ui-monospace, monospace; font-size: 13px; }
+  .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 2px 8px;
+           border-radius: 999px; border: 1px solid var(--c); color: var(--ink); white-space: nowrap; }
+  .badge i { font-style: normal; color: var(--c); }
+  .flags { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; color: var(--ink-2); }
+  .flags span { border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+  .msg { font-size: 12px; color: var(--ink-2); min-height: 18px; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  button { font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--page); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--ink-2); }
+  button.danger { border-color: var(--critical); }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .feed { list-style: none; margin: 0; padding: 0; max-height: 440px; overflow-y: auto; }
+  .feed li { display: grid; grid-template-columns: 70px 150px 1fr; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .feed .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .feed .r { font-weight: 600; }
+  .feed .warn .r::before { content: "▲ "; color: var(--serious); }
+  .feed .n { color: var(--ink-2); font-family: ui-monospace, monospace; font-size: 12px; }
+  .err { color: var(--critical); }
+  @media (max-width: 640px) { .feed li { grid-template-columns: 60px 1fr; } .feed .note { grid-column: 1 / -1; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Node Health Remediation</h1>
+    <span class="sub" id="updated">connecting…</span>
+  </header>
+  <div class="policies" id="policies"></div>
+
+  <h2>Nodes</h2>
+  <div class="grid" id="nodes"></div>
+  <div class="legend" id="legend"></div>
+
+  <h2>Operator events</h2>
+  <div class="card"><ul class="feed" id="events"></ul></div>
+</main>
+<script>
+// Each phase gets a status color AND an icon + label, so state never
+// depends on color alone.
+const PHASES = {
+  Healthy:        { c: "var(--good)",     i: "✓", label: "Healthy" },
+  Pending:        { c: "var(--warning)",  i: "◔", label: "Pending (threshold)" },
+  Waiting:        { c: "var(--warning)",  i: "⏸", label: "Waiting (cap)" },
+  WouldRemediate: { c: "var(--info)",     i: "◇", label: "Dry-run" },
+  Draining:       { c: "var(--serious)",  i: "↧", label: "Draining" },
+  Rebooting:      { c: "var(--serious)",  i: "↻", label: "Rebooting" },
+  Backoff:        { c: "var(--serious)",  i: "⏱", label: "Backoff" },
+  Failed:         { c: "var(--critical)", i: "✕", label: "Failed" },
+};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
+const badge = (phase) => {
+  const p = PHASES[phase] || { c: "var(--muted)", i: "?", label: phase };
+  return `<span class="badge" style="--c:${p.c}"><i aria-hidden="true">${p.i}</i>${esc(p.label)}</span>`;
+};
+
+$("legend").innerHTML = Object.keys(PHASES).map(badge).join("");
+
+function renderPolicies(policies) {
+  $("policies").innerHTML = policies.map((p) => {
+    const used = p.max ? p.remediating / p.max : 0;
+    const color = used >= 1 ? "var(--critical)" : used >= 0.75 ? "var(--warning)" : "var(--good)";
+    return `<div class="card policy">
+      <div><div class="name">${esc(p.name)}</div>
+        <div class="sub">threshold ${esc(p.threshold)}${p.dryRun ? " · <b>dry-run</b>" : ""}</div></div>
+      <div class="kpi"><div class="v">${p.matching}</div><div class="l">matching nodes</div></div>
+      <div class="kpi"><div class="v">${p.unhealthy}</div><div class="l">unhealthy</div></div>
+      <div class="kpi"><div class="v">${p.remediating} / ${p.max}</div><div class="l">under remediation / cap</div>
+        <div class="meter" role="img" aria-label="${Math.round(used * 100)}% of cap used">
+          <div style="width:${Math.min(used, 1) * 100}%;background:${color}"></div></div></div>
+    </div>`;
+  }).join("") || `<div class="card sub">No RemediationPolicy found. Run <code>make sample</code>.</div>`;
+}
+
+function renderNodes(nodes) {
+  $("nodes").innerHTML = nodes.map((n) => {
+    const p = PHASES[n.phase] || { c: "var(--muted)" };
+    const flags = [
+      `Ready ${esc(n.ready || "?")}`,
+      `GPU ${esc(n.gpu || "?")}${n.sticky ? " (sticky)" : ""}`,
+      n.cordoned ? "cordoned" : "schedulable",
+      n.attempts ? `attempt ${n.attempts}` : "",
+    ].filter(Boolean).map((f) => `<span>${f}</span>`).join("");
+    const actions = n.worker ? `<div class="actions">
+        <button class="danger" data-node="${esc(n.name)}" data-act="gpu">Break GPU</button>
+        <button data-node="${esc(n.name)}" data-act="sticky">Sticky GPU</button>
+        <button data-node="${esc(n.name)}" data-act="notready">NotReady</button>
+        <button data-node="${esc(n.name)}" data-act="heal">Heal</button></div>`
+      : `<div class="sub">control plane (runs the operator)</div>`;
+    return `<div class="card tile" style="--c:${p.c}">
+      <div class="top"><span class="name">${esc(n.name)}</span>${badge(n.phase)}</div>
+      <div class="flags">${flags}</div>
+      <div class="msg">${esc([n.reason, n.message].filter(Boolean).join(" · "))}</div>
+      ${actions}</div>`;
+  }).join("");
+}
+
+function renderEvents(events) {
+  $("events").innerHTML = events.map((e) => `<li class="${e.type === "Warning" ? "warn" : ""}">
+      <span class="t">${new Date(e.time).toLocaleTimeString()}</span>
+      <span><span class="r">${esc(e.reason)}</span><br><span class="n">${esc(e.node)}</span></span>
+      <span class="note">${esc(e.note)}</span></li>`).join("") || `<li class="sub">No events yet.</li>`;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/state");
+    if (!res.ok) throw new Error(await res.text());
+    const s = await res.json();
+    renderPolicies(s.policies || []);
+    renderNodes(s.nodes || []);
+    renderEvents(s.events || []);
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    $("updated").className = "sub";
+  } catch (err) {
+    $("updated").textContent = "cannot reach fake-infra: " + err.message;
+    $("updated").className = "sub err";
+  }
+}
+
+// One click handler for every button (event delegation), since tiles are
+// re-rendered every second.
+$("nodes").addEventListener("click", async (ev) => {
+  const b = ev.target.closest("button");
+  if (!b) return;
+  const node = encodeURIComponent(b.dataset.node);
+  const url = b.dataset.act === "heal"
+    ? [`/api/nodes/${node}/fault`, "DELETE"]
+    : [`/api/nodes/${node}/fault?type=${b.dataset.act === "notready" ? "notready" : "gpu"}&sticky=${b.dataset.act === "sticky"}`, "POST"];
+  b.disabled = true;
+  try {
+    const res = await fetch(url[0], { method: url[1] });
+    if (!res.ok) alert(await res.text());
+  } finally { b.disabled = false; refresh(); }
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
