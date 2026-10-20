@@ -46,7 +46,7 @@ pdb_blocks=$(event_offset "$node" DrainBlockedByPDB "$t0")
 
 record "### 5. Leader SIGKILLed mid-drain"
 record ""
-record "Killed \`${old_pod}\`; new leader \`${new%%_*}\`."
+record "Killed \`${old_pod}\`; new leader \`${new%%_*}\` (a new process either way; the same pod name means the killed container restarted and won the lease)."
 record ""
 record "| Leader failover | Back in service (from fault) | Reboot requests | PDB blocked an eviction |"
 record "|---|---|---|---|"

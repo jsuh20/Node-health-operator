@@ -317,7 +317,21 @@ INFO  Remediation succeeded  {"policy": "gpu-pool", "node": "nodehealth-worker2"
 
 Full output: [docs/chaos-results.md](docs/chaos-results.md).
 
-CHAOS_SUMMARY
+All 6 scenarios pass (run 2). Times are seconds after the fault was injected,
+taken from the operator's own events.
+
+| Scenario | Result |
+|---|---|
+| 1. GPU fault (3 trials) | Detected at once; cordoned at 59.4–60.0s (threshold 60s); **back in service at 87–89s** |
+| 2. 20s blip | Detected, **never acted on** |
+| 3. Kubelet stopped (real NotReady) | Kubernetes marked it Unknown at 48s; cordoned at 108s; **back in service at 116s** |
+| 4. 3 of 4 nodes broken at once, cap 1 | **Never more than 1** under remediation (103 samples); fixed one after another at 89s / 117s / 145s |
+| 5. Leader `kill -9` mid-drain | New leader in **17s** (lease expiry); node finished at 102s with **exactly 1 reboot request**, still attempt 1 |
+| 6. Fault a reboot can't fix | Retry exactly 10s after the failure; gave up after 2 attempts; node left cordoned; a second broken node **Waiting** behind it |
+
+In scenario 5, the lease was won by a new process in the restarted container of the
+killed pod (it raced the standby replica and won). Either way, a fresh process
+with no memory resumed purely from the state on the Node.
 
 ### What broke during testing
 
