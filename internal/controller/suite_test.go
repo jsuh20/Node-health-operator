@@ -21,18 +21,23 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/clock"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	remediationv1alpha1 "github.com/jsuh20/node-health-operator/api/v1alpha1"
+	"github.com/jsuh20/node-health-operator/internal/remediation"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -83,6 +88,32 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	// Run the real controller against the test API server, in a goroutine,
+	// exactly as cmd/main.go wires it (minus metrics and leader election).
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	Expect(err).NotTo(HaveOccurred())
+	Expect((&RemediationPolicyReconciler{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("node-health-operator"),
+		Clock:     clock.RealClock{},
+		Drainer:   &remediation.Drainer{Client: mgr.GetClient(), Reader: mgr.GetAPIReader()},
+	}).SetupWithManager(mgr)).To(Succeed())
+
+	go func() {
+		defer GinkgoRecover()
+		Expect(mgr.Start(ctx)).To(Succeed())
+	}()
+
+	SetDefaultEventuallyTimeout(30 * time.Second)
+	SetDefaultEventuallyPollingInterval(200 * time.Millisecond)
+	SetDefaultConsistentlyDuration(3 * time.Second)
+	SetDefaultConsistentlyPollingInterval(200 * time.Millisecond)
 })
 
 var _ = AfterSuite(func() {

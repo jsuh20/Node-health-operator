@@ -19,40 +19,177 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// UnhealthyCondition says which node condition value counts as "unhealthy".
+// Examples: {type: Ready, status: "False"}, {type: Ready, status: Unknown},
+// {type: GPUHealthy, status: "False"}.
+type UnhealthyCondition struct {
+	// type is the node condition type, e.g. Ready, DiskPressure, GPUHealthy.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Type string `json:"type"`
 
-// RemediationPolicySpec defines the desired state of RemediationPolicy
-type RemediationPolicySpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// status is the condition status that counts as unhealthy.
+	// +required
+	// +kubebuilder:validation:Enum=True;False;Unknown
+	Status string `json:"status"`
+}
 
-	// foo is an example field of RemediationPolicy. Edit remediationpolicy_types.go to remove/update
+// RemediationStrategy is the final, disruptive step after cordon and drain.
+// +kubebuilder:validation:Enum=Reboot;Replace
+type RemediationStrategy string
+
+const (
+	StrategyReboot  RemediationStrategy = "Reboot"
+	StrategyReplace RemediationStrategy = "Replace"
+)
+
+// RetryPolicy controls exponential backoff between failed attempts.
+type RetryPolicy struct {
+	// maxAttempts is how many reboot/replace attempts to make before giving up
+	// and marking the node Failed (it then stays cordoned for a human).
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=1
+	MaxAttempts int32 `json:"maxAttempts,omitempty"`
+
+	// initialBackoff is the wait after the first failure. It doubles after
+	// each further failure, up to maxBackoff.
+	// +optional
+	// +kubebuilder:default="30s"
+	InitialBackoff metav1.Duration `json:"initialBackoff,omitempty"`
+
+	// maxBackoff caps the wait between attempts.
+	// +optional
+	// +kubebuilder:default="10m"
+	MaxBackoff metav1.Duration `json:"maxBackoff,omitempty"`
+}
+
+// RemediationPolicySpec defines the desired state of RemediationPolicy.
+type RemediationPolicySpec struct {
+	// nodeSelector picks the nodes this policy manages. An empty selector
+	// matches every node.
+	// +required
+	NodeSelector metav1.LabelSelector `json:"nodeSelector"`
+
+	// unhealthyConditions lists the condition values that make a node
+	// unhealthy. Matching any one of them is enough.
+	// +required
+	// +kubebuilder:validation:MinItems=1
+	UnhealthyConditions []UnhealthyCondition `json:"unhealthyConditions"`
+
+	// unhealthyDuration is the hysteresis threshold: a condition must stay
+	// unhealthy this long before the node is remediated. Short blips are ignored.
+	// +optional
+	// +kubebuilder:default="2m"
+	UnhealthyDuration metav1.Duration `json:"unhealthyDuration,omitempty"`
+
+	// maxConcurrent is the blast-radius cap: the most matching nodes that may
+	// be under remediation (or Failed) at once. An integer ("2") or a percent
+	// of matching nodes ("25%"). Percentages round down, but never below 1.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:XIntOrString
+	MaxConcurrent intstr.IntOrString `json:"maxConcurrent,omitempty"`
+
+	// strategy is the step after cordon and drain.
+	// +optional
+	// +kubebuilder:default=Reboot
+	Strategy RemediationStrategy `json:"strategy,omitempty"`
+
+	// drainTimeout is how long draining may take (e.g. while a
+	// PodDisruptionBudget blocks evictions) before the attempt counts as failed.
+	// +optional
+	// +kubebuilder:default="5m"
+	DrainTimeout metav1.Duration `json:"drainTimeout,omitempty"`
+
+	// rebootTimeout is how long to wait for the node to come back healthy
+	// after a reboot/replace request before the attempt counts as failed.
+	// +optional
+	// +kubebuilder:default="5m"
+	RebootTimeout metav1.Duration `json:"rebootTimeout,omitempty"`
+
+	// retry controls backoff between failed attempts.
+	// +optional
+	// +kubebuilder:default={}
+	Retry RetryPolicy `json:"retry,omitempty"`
+
+	// dryRun makes the controller decide and emit events/logs, but never
+	// change nodes or evict pods.
+	// +optional
+	DryRun bool `json:"dryRun,omitempty"`
+}
+
+// NodePhase is where a node is in the remediation state machine.
+type NodePhase string
+
+const (
+	// PhasePending: unhealthy, but not for long enough yet (hysteresis).
+	PhasePending NodePhase = "Pending"
+	// PhaseWaiting: past the threshold, but the blast-radius cap is full.
+	PhaseWaiting NodePhase = "Waiting"
+	// PhaseDryRun: dry-run mode; the controller would start remediating.
+	PhaseDryRun NodePhase = "WouldRemediate"
+	// PhaseDraining: cordoned, pods being evicted.
+	PhaseDraining NodePhase = "Draining"
+	// PhaseRebooting: reboot/replace requested, waiting for the node to recover.
+	PhaseRebooting NodePhase = "Rebooting"
+	// PhaseBackoff: the last attempt failed; waiting before retrying.
+	PhaseBackoff NodePhase = "Backoff"
+	// PhaseFailed: out of attempts. The node stays cordoned for a human.
+	PhaseFailed NodePhase = "Failed"
+)
+
+// NodeStatus is one non-healthy node as seen by this policy.
+type NodeStatus struct {
+	// name of the node.
+	Name string `json:"name"`
+	// phase in the remediation state machine.
+	Phase NodePhase `json:"phase"`
+	// reason is the unhealthy condition, e.g. "Ready=Unknown".
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// unhealthySince is when the unhealthy condition started.
+	// +optional
+	UnhealthySince *metav1.Time `json:"unhealthySince,omitempty"`
+	// attempts is the number of reboot/replace attempts started.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+	// nextRetryTime is set while in Backoff.
+	// +optional
+	NextRetryTime *metav1.Time `json:"nextRetryTime,omitempty"`
+	// message is a human-readable detail.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // RemediationPolicyStatus defines the observed state of RemediationPolicy.
 type RemediationPolicyStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the RemediationPolicy resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// observedGeneration is the spec generation this status was computed from.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// matchingNodes is how many nodes the selector matches.
+	// +optional
+	MatchingNodes int32 `json:"matchingNodes"`
+	// unhealthyNodes is how many matching nodes have an unhealthy condition.
+	// +optional
+	UnhealthyNodes int32 `json:"unhealthyNodes"`
+	// nodesUnderRemediation counts nodes in Draining, Rebooting, Backoff or
+	// Failed: the nodes that use up the blast-radius budget.
+	// +optional
+	NodesUnderRemediation int32 `json:"nodesUnderRemediation"`
+	// maxConcurrent is the blast-radius cap resolved to a node count.
+	// +optional
+	MaxConcurrent int32 `json:"maxConcurrent"`
+	// nodes lists every non-healthy node and where it is in remediation.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Nodes []NodeStatus `json:"nodes,omitempty"`
+	// conditions: BlastRadiusLimited is True while unhealthy nodes are
+	// waiting because the cap is full.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -61,7 +198,13 @@ type RemediationPolicyStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Cluster,shortName=rp
+// +kubebuilder:printcolumn:name="Matching",type=integer,JSONPath=`.status.matchingNodes`
+// +kubebuilder:printcolumn:name="Unhealthy",type=integer,JSONPath=`.status.unhealthyNodes`
+// +kubebuilder:printcolumn:name="Remediating",type=integer,JSONPath=`.status.nodesUnderRemediation`
+// +kubebuilder:printcolumn:name="Max",type=integer,JSONPath=`.status.maxConcurrent`
+// +kubebuilder:printcolumn:name="DryRun",type=boolean,JSONPath=`.spec.dryRun`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // RemediationPolicy is the Schema for the remediationpolicies API
 type RemediationPolicy struct {
