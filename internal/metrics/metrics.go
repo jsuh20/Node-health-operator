@@ -8,6 +8,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// labelPolicy is on every metric: the RemediationPolicy name.
+const labelPolicy = "policy"
+
 // Result label values for RemediationsTotal.
 const (
 	ResultStarted   = "started"
@@ -22,7 +25,7 @@ var (
 		Name:    "nodehealth_detection_seconds",
 		Help:    "Time from a node condition turning unhealthy to the controller observing it.",
 		Buckets: []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 120},
-	}, []string{"policy"})
+	}, []string{labelPolicy})
 
 	// TimeToRemediateSeconds: fault start until the node is healthy and back
 	// in service. End to end, so it includes the hysteresis threshold.
@@ -30,32 +33,32 @@ var (
 		Name:    "nodehealth_time_to_remediate_seconds",
 		Help:    "Time from a node condition turning unhealthy to the node being healthy and uncordoned.",
 		Buckets: prometheus.ExponentialBuckets(15, 2, 10), // 15s .. ~2h
-	}, []string{"policy"})
+	}, []string{labelPolicy})
 
 	RemediationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nodehealth_remediations_total",
 		Help: "Remediations by result (started, succeeded, failed).",
-	}, []string{"policy", "result"})
+	}, []string{labelPolicy, "result"})
 
 	AttemptFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nodehealth_remediation_attempt_failures_total",
 		Help: "Failed remediation attempts (each one triggers a backoff or a final Failed).",
-	}, []string{"policy", "reason"})
+	}, []string{labelPolicy, "reason"})
 
 	NodesUnderRemediation = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nodehealth_nodes_under_remediation",
 		Help: "Nodes using the blast-radius budget (Draining, Rebooting, Backoff, Failed).",
-	}, []string{"policy"})
+	}, []string{labelPolicy})
 
 	BlastRadiusLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nodehealth_blast_radius_limit",
 		Help: "maxConcurrent resolved to a node count.",
-	}, []string{"policy"})
+	}, []string{labelPolicy})
 
 	UnhealthyNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nodehealth_unhealthy_nodes",
 		Help: "Matching nodes with an unhealthy condition (any phase, including Pending).",
-	}, []string{"policy"})
+	}, []string{labelPolicy})
 )
 
 func init() {

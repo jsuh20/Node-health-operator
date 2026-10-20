@@ -45,6 +45,7 @@ import (
 const (
 	gpuCondition    = corev1.NodeConditionType("GPUHealthy")
 	stickyAnnotaton = "fake-infra.nodehealth.dev/sticky-fault"
+	trueString      = "true"
 )
 
 type infra struct {
@@ -167,7 +168,7 @@ func (f *infra) carryOut(ctx context.Context, node, req string) {
 		log.Printf("%s: get: %v", node, err)
 		return
 	}
-	sticky := n.Annotations[stickyAnnotaton] == "true"
+	sticky := n.Annotations[stickyAnnotaton] == trueString
 	if !sticky || replace {
 		if err := f.setGPU(ctx, node, true); err != nil {
 			log.Printf("%s: clear gpu fault: %v", node, err)
@@ -184,7 +185,8 @@ func (f *infra) carryOut(ctx context.Context, node, req string) {
 		log.Printf("%s: write completion: %v", node, err)
 		return
 	}
-	log.Printf("%s: %s done in %s (sticky fault kept: %v)", node, req, time.Since(started).Round(time.Second), sticky && !replace)
+	took := time.Since(started).Round(time.Second)
+	log.Printf("%s: %s done in %s (sticky fault kept: %v)", node, req, took, sticky && !replace)
 }
 
 // readyHeartbeat returns the node's latest Ready heartbeat time.
@@ -224,14 +226,14 @@ func (f *infra) waitForFreshReady(ctx context.Context, node string, since time.T
 func (f *infra) handleInject(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("name")
 	kind := r.URL.Query().Get("type")
-	sticky := r.URL.Query().Get("sticky") == "true"
+	sticky := r.URL.Query().Get("sticky") == trueString
 	var err error
 	switch kind {
 	case "gpu", "":
 		kind = "gpu"
 		err = f.setGPU(r.Context(), node, false)
 		if err == nil && sticky {
-			err = f.annotate(r.Context(), node, stickyAnnotaton, "true")
+			err = f.annotate(r.Context(), node, stickyAnnotaton, trueString)
 		}
 	case "notready":
 		err = f.docker(r.Context(), "stop", node)

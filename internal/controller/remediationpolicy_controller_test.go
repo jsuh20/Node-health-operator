@@ -35,7 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/jsuh20/node-health-operator/api/v1alpha1"
@@ -43,6 +42,12 @@ import (
 )
 
 // ---- helpers ---------------------------------------------------------------
+
+const (
+	gpuHealthy  = corev1.NodeConditionType("GPUHealthy")
+	testNS      = "default"
+	criticalApp = "critical"
+)
 
 // pool returns a unique label value per test so tests don't see each
 // other's nodes.
@@ -53,16 +58,15 @@ func newPool() string {
 	return fmt.Sprintf("pool-%d", poolSeq)
 }
 
-func makeNode(name, pool string) *corev1.Node {
+func makeNode(name, pool string) {
 	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"pool": pool}}}
 	Expect(k8sClient.Create(ctx, n)).To(Succeed())
 	setConditions(name,
 		corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
-		corev1.NodeCondition{Type: "GPUHealthy", Status: corev1.ConditionTrue})
+		corev1.NodeCondition{Type: gpuHealthy, Status: corev1.ConditionTrue})
 	DeferCleanup(func() {
 		_ = k8sClient.Delete(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
 	})
-	return n
 }
 
 // setConditions replaces the node's conditions. LastTransitionTime defaults
@@ -84,7 +88,7 @@ func setConditions(name string, conds ...corev1.NodeCondition) {
 func breakGPU(name string, ago time.Duration) {
 	setConditions(name,
 		corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
-		corev1.NodeCondition{Type: "GPUHealthy", Status: corev1.ConditionFalse,
+		corev1.NodeCondition{Type: gpuHealthy, Status: corev1.ConditionFalse,
 			LastTransitionTime: metav1.NewTime(time.Now().Add(-ago))})
 }
 
@@ -113,7 +117,7 @@ func makePolicy(name, pool string, mutate func(*v1alpha1.RemediationPolicySpec))
 			UnhealthyConditions: []v1alpha1.UnhealthyCondition{
 				{Type: "Ready", Status: "False"},
 				{Type: "Ready", Status: "Unknown"},
-				{Type: "GPUHealthy", Status: "False"},
+				{Type: string(gpuHealthy), Status: "False"},
 			},
 			UnhealthyDuration: metav1.Duration{Duration: time.Minute},
 			MaxConcurrent:     intstr.FromInt32(1),
@@ -147,7 +151,7 @@ func getPolicy(name string) *v1alpha1.RemediationPolicy {
 
 func makePod(name, node string, podLabels map[string]string) {
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: podLabels},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS, Labels: podLabels},
 		Spec: corev1.PodSpec{
 			NodeName:   node,
 			Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
@@ -168,7 +172,7 @@ func makePod(name, node string, podLabels map[string]string) {
 // terminating; remove them for good.
 func finishPodDeletions(node string) {
 	var pods corev1.PodList
-	Expect(k8sClient.List(ctx, &pods, client.InNamespace("default"))).To(Succeed())
+	Expect(k8sClient.List(ctx, &pods, client.InNamespace(testNS))).To(Succeed())
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Spec.NodeName == node && p.DeletionTimestamp != nil {
@@ -177,9 +181,9 @@ func finishPodDeletions(node string) {
 	}
 }
 
-// completeReboot plays the infrastructure: answer the request and (if
-// `fixes`) clear the fault, like a successful reboot would.
-func completeReboot(name string, fixes bool) {
+// completeReboot plays the infrastructure: answer the request and clear the
+// fault, like a successful reboot would.
+func completeReboot(name string) {
 	Eventually(func() error {
 		n := getNode(name)
 		req := n.Annotations[remediation.RequestAnnotation]
@@ -190,11 +194,9 @@ func completeReboot(name string, fixes bool) {
 		n.Annotations[remediation.CompletedAnnotation] = req
 		return k8sClient.Update(ctx, n)
 	}).Should(Succeed())
-	if fixes {
-		setConditions(name,
-			corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
-			corev1.NodeCondition{Type: "GPUHealthy", Status: corev1.ConditionTrue})
-	}
+	setConditions(name,
+		corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+		corev1.NodeCondition{Type: gpuHealthy, Status: corev1.ConditionTrue})
 }
 
 // ---- specs -----------------------------------------------------------------
@@ -212,7 +214,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 		Consistently(func() bool { return getNode("hyst-1").Spec.Unschedulable }).Should(BeFalse())
 
 		By("the blip clears before the threshold: nothing ever happens")
-		setConditions("hyst-1", corev1.NodeCondition{Type: "GPUHealthy", Status: corev1.ConditionTrue})
+		setConditions("hyst-1", corev1.NodeCondition{Type: gpuHealthy, Status: corev1.ConditionTrue})
 		Eventually(func() []v1alpha1.NodeStatus { return getPolicy("hyst").Status.Nodes }).Should(BeEmpty())
 		Expect(getNode("hyst-1").Spec.Unschedulable).To(BeFalse())
 	})
@@ -232,7 +234,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 		By("evicting the pod; the drain waits until it is really gone")
 		Eventually(func() bool {
 			p := &corev1.Pod{}
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "happy-workload"}, p)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "happy-workload"}, p)).To(Succeed())
 			return p.DeletionTimestamp != nil
 		}).Should(BeTrue())
 		Consistently(phaseOf("happy-1"), time.Second).Should(Equal(v1alpha1.PhaseDraining))
@@ -240,7 +242,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 
 		By("requesting a reboot once drained")
 		Eventually(phaseOf("happy-1")).Should(Equal(v1alpha1.PhaseRebooting))
-		completeReboot("happy-1", true)
+		completeReboot("happy-1")
 
 		By("uncordoning and forgetting the node once it is healthy")
 		Eventually(phaseOf("happy-1")).Should(BeEmpty())
@@ -292,7 +294,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 			}
 		}
 		Eventually(phaseOf(first)).Should(Equal(v1alpha1.PhaseRebooting))
-		completeReboot(first, true)
+		completeReboot(first)
 		Eventually(phaseOf(first)).Should(BeEmpty())
 		Eventually(active).Should(Equal(2))
 		Consistently(active).Should(Equal(2))
@@ -301,12 +303,12 @@ var _ = Describe("RemediationPolicy controller", func() {
 	It("respects PodDisruptionBudgets and backs off when the drain times out", func() {
 		pool := newPool()
 		makeNode("pdb-1", pool)
-		makePod("pdb-protected", "pdb-1", map[string]string{"app": "critical"})
+		makePod("pdb-protected", "pdb-1", map[string]string{"app": criticalApp})
 		pdb := &policyv1.PodDisruptionBudget{
-			ObjectMeta: metav1.ObjectMeta{Name: "critical", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: criticalApp, Namespace: testNS},
 			Spec: policyv1.PodDisruptionBudgetSpec{
-				MinAvailable: ptr.To(intstr.FromInt32(1)),
-				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "critical"}},
+				MinAvailable: new(intstr.FromInt32(1)),
+				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": criticalApp}},
 			},
 		}
 		Expect(k8sClient.Create(ctx, pdb)).To(Succeed())
@@ -335,7 +337,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 
 		By("the pod is never evicted")
 		p := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "pdb-protected"}, p)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "pdb-protected"}, p)).To(Succeed())
 		Expect(p.DeletionTimestamp).To(BeNil())
 
 		By("the drain times out into Backoff instead of forcing it")
@@ -388,7 +390,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 		Eventually(phaseOf("resume-1")).Should(Equal(v1alpha1.PhaseRebooting))
 		s, _ := remediation.GetState(getNode("resume-1"))
 		Expect(s.Attempts).To(Equal(int32(1)))
-		completeReboot("resume-1", true)
+		completeReboot("resume-1")
 		Eventually(phaseOf("resume-1")).Should(BeEmpty())
 		Expect(getNode("resume-1").Spec.Unschedulable).To(BeFalse())
 	})
@@ -405,7 +407,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 		breakGPU("admin-1", 5*time.Minute)
 
 		Eventually(phaseOf("admin-1")).Should(Equal(v1alpha1.PhaseRebooting))
-		completeReboot("admin-1", true)
+		completeReboot("admin-1")
 		Eventually(phaseOf("admin-1")).Should(BeEmpty())
 		Expect(getNode("admin-1").Spec.Unschedulable).To(BeTrue())
 	})
@@ -425,7 +427,7 @@ var _ = Describe("RemediationPolicy controller", func() {
 			return n.Spec.Unschedulable || hasState
 		}).Should(BeFalse())
 		p := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "dry-workload"}, p)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "dry-workload"}, p)).To(Succeed())
 		Expect(p.DeletionTimestamp).To(BeNil())
 	})
 

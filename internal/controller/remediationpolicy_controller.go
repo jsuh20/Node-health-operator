@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -140,16 +140,51 @@ func (r *RemediationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, nil
 	}
 
+	p := &pass{policy: &policy, selector: selector, nodes: nodes.Items, now: now,
+		total: total, maxConcurrent: maxConcurrent, requeue: newRequeue()}
+
 	// ---- Decide + act, node by node --------------------------------------
-	var (
-		statuses   []v1alpha1.NodeStatus
-		candidates []remediation.Candidate
-		unhealthy  int
-		active     int
-		requeue    = newRequeue()
-	)
-	for i := range nodes.Items {
-		node := &nodes.Items[i]
+	if err := r.processNodes(ctx, p); err != nil {
+		return ctrl.Result{}, err
+	}
+	// ---- Blast-radius cap -------------------------------------------------
+	if err := r.applyCap(ctx, p); err != nil {
+		return ctrl.Result{}, err
+	}
+	// ---- Record -----------------------------------------------------------
+	metrics.NodesUnderRemediation.WithLabelValues(policy.Name).Set(float64(p.active))
+	metrics.BlastRadiusLimit.WithLabelValues(policy.Name).Set(float64(maxConcurrent))
+	metrics.UnhealthyNodes.WithLabelValues(policy.Name).Set(float64(p.unhealthy))
+
+	if err := r.updateStatus(ctx, p); err != nil {
+		return ctrl.Result{}, err
+	}
+	return p.requeue.result(), nil
+}
+
+// pass holds what one reconcile learns and decides as it walks the nodes.
+type pass struct {
+	policy        *v1alpha1.RemediationPolicy
+	selector      labels.Selector
+	nodes         []corev1.Node
+	now           time.Time
+	total         int // nodes the selector matches
+	maxConcurrent int // the cap, as a node count
+
+	statuses   []v1alpha1.NodeStatus
+	candidates []remediation.Candidate // past the threshold, not started yet
+	unhealthy  int
+	active     int // nodes using the cap
+	waiting    int // candidates held back by the cap
+	requeue    *requeue
+}
+
+// processNodes looks at every node the policy cares about: advances the ones
+// it owns, and sorts the rest into healthy, Pending, or candidate.
+func (r *RemediationPolicyReconciler) processNodes(ctx context.Context, p *pass) error {
+	log := logf.FromContext(ctx)
+	for i := range p.nodes {
+		node := &p.nodes[i]
 		nlog := log.WithValues("node", node.Name)
 		nctx := logf.IntoContext(ctx, nlog)
 
@@ -158,8 +193,8 @@ func (r *RemediationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			nlog.Error(err, "Ignoring node with unreadable state annotation")
 			continue
 		}
-		matches := selector.Matches(labels.Set(node.Labels))
-		ours := state != nil && state.Policy == policy.Name
+		matches := p.selector.Matches(labels.Set(node.Labels))
+		ours := state != nil && state.Policy == p.policy.Name
 		if !matches && !ours {
 			continue
 		}
@@ -167,23 +202,23 @@ func (r *RemediationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			continue // another policy owns this node; let it finish
 		}
 
-		health := remediation.EvaluateHealth(node, policy.Spec.UnhealthyConditions)
+		health := remediation.EvaluateHealth(node, p.policy.Spec.UnhealthyConditions)
 		if health.Unhealthy {
-			unhealthy++
-			r.noteDetected(nctx, &policy, node, health, now)
+			p.unhealthy++
+			r.noteDetected(nctx, p.policy, node, health, p.now)
 		} else {
-			r.forgetDetected(policy.Name, node.Name)
+			r.forgetDetected(p.policy.Name, node.Name)
 		}
 
 		if ours {
-			st, after, stillActive, err := r.advance(nctx, &policy, node, state, health, now)
+			st, after, stillActive, err := r.advance(nctx, p.policy, node, state, health, p.now)
 			if err != nil {
-				return ctrl.Result{}, err
+				return err
 			}
-			statuses = append(statuses, st)
-			requeue.at(after)
+			p.statuses = append(p.statuses, st)
+			p.requeue.at(after)
 			if stillActive {
-				active++
+				p.active++
 			}
 			continue
 		}
@@ -191,74 +226,71 @@ func (r *RemediationPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		if !health.Unhealthy {
 			continue
 		}
-		threshold := policy.Spec.UnhealthyDuration.Duration
-		if !remediation.ThresholdReached(health, threshold, now) {
-			statuses = append(statuses, nodeStatus(node.Name, v1alpha1.PhasePending, health,
+		threshold := p.policy.Spec.UnhealthyDuration.Duration
+		if !remediation.ThresholdReached(health, threshold, p.now) {
+			p.statuses = append(p.statuses, nodeStatus(node.Name, v1alpha1.PhasePending, health,
 				fmt.Sprintf("waiting for the %s threshold", threshold)))
-			requeue.at(health.Since.Add(threshold).Sub(now))
+			p.requeue.at(health.Since.Add(threshold).Sub(p.now))
 			continue
 		}
-		candidates = append(candidates, remediation.Candidate{Name: node.Name, Health: health})
+		p.candidates = append(p.candidates, remediation.Candidate{Name: node.Name, Health: health})
 	}
+	return nil
+}
 
-	// ---- Blast-radius cap -------------------------------------------------
-	if len(candidates) > 0 && !policy.Spec.DryRun {
+// applyCap starts as many candidates as the blast-radius cap allows (or, in
+// dry-run, reports that it would) and marks the rest Waiting.
+func (r *RemediationPolicyReconciler) applyCap(ctx context.Context, p *pass) error {
+	log := logf.FromContext(ctx)
+	policy := p.policy
+
+	if len(p.candidates) > 0 && !policy.Spec.DryRun {
 		// The cache can lag behind our own writes by a moment. If we trusted it
 		// right after starting a remediation, we could count one too few
 		// active nodes and break the cap. So recount straight from the API
 		// server before handing out any new slots.
 		live, err := r.countActiveLive(ctx, policy.Name)
 		if err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
-		if live > active {
-			active = live
-		}
+		p.active = max(p.active, live)
 	}
-	start, waiting := remediation.SelectToStart(candidates, active, maxConcurrent)
+	start, waiting := remediation.SelectToStart(p.candidates, p.active, p.maxConcurrent)
+	p.waiting = len(waiting)
 
 	for _, c := range start {
-		node := nodeByName(nodes.Items, c.Name)
+		node := nodeByName(p.nodes, c.Name)
 		if policy.Spec.DryRun {
-			if prevStatus(&policy, c.Name).Phase != v1alpha1.PhaseDryRun {
-				r.Recorder.Eventf(node, &policy, corev1.EventTypeNormal, "DryRun", "Cordon",
+			if prevStatus(policy, c.Name).Phase != v1alpha1.PhaseDryRun {
+				r.Recorder.Eventf(node, policy, corev1.EventTypeNormal, "DryRun", "Cordon",
 					"dry-run: would cordon, drain and %s node (%s for %s)",
-					policy.Spec.Strategy, c.Health.Reason, now.Sub(c.Health.Since).Round(time.Second))
+					policy.Spec.Strategy, c.Health.Reason, p.now.Sub(c.Health.Since).Round(time.Second))
 				log.Info("Dry-run: would start remediation", "node", c.Name, "reason", c.Health.Reason)
 			}
-			statuses = append(statuses, nodeStatus(c.Name, v1alpha1.PhaseDryRun, c.Health, "dry-run: no action taken"))
+			p.statuses = append(p.statuses, nodeStatus(c.Name, v1alpha1.PhaseDryRun, c.Health, "dry-run: no action taken"))
 			continue
 		}
-		st, err := r.start(logf.IntoContext(ctx, log.WithValues("node", c.Name)), &policy, node, c.Health, now)
+		st, err := r.start(logf.IntoContext(ctx, log.WithValues("node", c.Name)), policy, node, c.Health, p.now)
 		if err != nil {
-			return ctrl.Result{}, err
+			return err
 		}
-		statuses = append(statuses, st)
-		active++
-		requeue.at(time.Second)
+		p.statuses = append(p.statuses, st)
+		p.active++
+		p.requeue.at(time.Second)
 	}
 	for _, c := range waiting {
-		node := nodeByName(nodes.Items, c.Name)
+		node := nodeByName(p.nodes, c.Name)
 		// Events only on state CHANGES: this loop runs every few seconds while
 		// other nodes drain, and one event per pass would be spam.
-		if prevStatus(&policy, c.Name).Phase != v1alpha1.PhaseWaiting {
-			log.Info("Blast-radius cap reached; node must wait", "node", c.Name, "active", active, "max", maxConcurrent)
-			r.Recorder.Eventf(node, &policy, corev1.EventTypeNormal, "BlastRadiusLimited", "Wait",
-				"waiting: %d/%d nodes already under remediation", active, maxConcurrent)
+		if prevStatus(policy, c.Name).Phase != v1alpha1.PhaseWaiting {
+			log.Info("Blast-radius cap reached; node must wait", "node", c.Name, "active", p.active, "max", p.maxConcurrent)
+			r.Recorder.Eventf(node, policy, corev1.EventTypeNormal, "BlastRadiusLimited", "Wait",
+				"waiting: %d/%d nodes already under remediation", p.active, p.maxConcurrent)
 		}
-		statuses = append(statuses, nodeStatus(c.Name, v1alpha1.PhaseWaiting, c.Health,
-			fmt.Sprintf("blast-radius cap reached (%d/%d)", active, maxConcurrent)))
+		p.statuses = append(p.statuses, nodeStatus(c.Name, v1alpha1.PhaseWaiting, c.Health,
+			fmt.Sprintf("blast-radius cap reached (%d/%d)", p.active, p.maxConcurrent)))
 	}
-
-	// ---- Record -----------------------------------------------------------
-	metrics.NodesUnderRemediation.WithLabelValues(policy.Name).Set(float64(active))
-	metrics.BlastRadiusLimit.WithLabelValues(policy.Name).Set(float64(maxConcurrent))
-	metrics.UnhealthyNodes.WithLabelValues(policy.Name).Set(float64(unhealthy))
-
-	if err := r.updateStatus(ctx, &policy, total, unhealthy, active, maxConcurrent, statuses, len(waiting)); err != nil {
-		return ctrl.Result{}, err
-	}
-	return requeue.result(), nil
+	return nil
 }
 
 // start claims a node and cordons it in ONE write: the state annotation and
@@ -534,9 +566,10 @@ func (r *RemediationPolicyReconciler) countActiveLive(ctx context.Context, polic
 	return n, nil
 }
 
-func (r *RemediationPolicyReconciler) updateStatus(ctx context.Context, policy *v1alpha1.RemediationPolicy,
-	total, unhealthy, active, maxConcurrent int, nodes []v1alpha1.NodeStatus, waiting int) error {
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
+func (r *RemediationPolicyReconciler) updateStatus(ctx context.Context, p *pass) error {
+	policy, nodes := p.policy, p.statuses
+	slices.SortFunc(nodes, func(a, b v1alpha1.NodeStatus) int { return strings.Compare(a.Name, b.Name) })
+	total, unhealthy, active, maxConcurrent, waiting := p.total, p.unhealthy, p.active, p.maxConcurrent, p.waiting
 
 	updated := policy.DeepCopy()
 	s := &updated.Status
@@ -594,9 +627,7 @@ func (r *RemediationPolicyReconciler) noteDetected(ctx context.Context, policy *
 	}
 
 	latency := now.Sub(h.Since)
-	if latency < 0 {
-		latency = 0 // clock skew between nodes and controller
-	}
+	latency = max(latency, 0) // clock skew between nodes and controller
 	metrics.DetectionSeconds.WithLabelValues(policy.Name).Observe(latency.Seconds())
 	logf.FromContext(ctx).Info("Detected unhealthy node", "reason", h.Reason, "since", h.Since, "detectionLatency", latency.Round(time.Millisecond))
 	r.Recorder.Eventf(node, policy, corev1.EventTypeWarning, "Detected", "Observe",

@@ -2,7 +2,8 @@ package remediation
 
 import (
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -106,19 +107,13 @@ type Candidate struct {
 // deterministic.
 func SelectToStart(candidates []Candidate, active, maxConcurrent int) (start, wait []Candidate) {
 	sorted := append([]Candidate(nil), candidates...) // copy; don't reorder the caller's slice
-	sort.Slice(sorted, func(i, j int) bool {
-		if !sorted[i].Health.Since.Equal(sorted[j].Health.Since) {
-			return sorted[i].Health.Since.Before(sorted[j].Health.Since)
+	slices.SortFunc(sorted, func(a, b Candidate) int {
+		if c := a.Health.Since.Compare(b.Health.Since); c != 0 {
+			return c
 		}
-		return sorted[i].Name < sorted[j].Name
+		return strings.Compare(a.Name, b.Name)
 	})
 
-	free := maxConcurrent - active
-	if free < 0 {
-		free = 0
-	}
-	if free > len(sorted) {
-		free = len(sorted)
-	}
+	free := min(max(maxConcurrent-active, 0), len(sorted))
 	return sorted[:free], sorted[free:]
 }

@@ -3,7 +3,8 @@ package main
 import (
 	"embed"
 	"net/http"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,8 +15,8 @@ import (
 	"github.com/jsuh20/node-health-operator/internal/remediation"
 )
 
-// go:embed bakes web/index.html into the binary at compile time, so the
-// dashboard needs no separate files at runtime.
+// The embed directive below bakes web/index.html into the binary at compile
+// time, so the dashboard needs no separate files at runtime.
 //
 //go:embed web/index.html
 var webFS embed.FS
@@ -111,7 +112,7 @@ func snapshot(r *http.Request, c client.Client) (*State, error) {
 			Name: n.Name, Worker: !isCP, Phase: "Healthy", Cordoned: n.Spec.Unschedulable,
 			Ready:     condStatus(n, corev1.NodeReady),
 			GPU:       condStatus(n, gpuCondition),
-			Sticky:    n.Annotations[stickyAnnotaton] == "true",
+			Sticky:    n.Annotations[stickyAnnotaton] == trueString,
 			Rebooting: n.Annotations[remediation.RequestAnnotation] != "",
 		}
 		if st, ok := statusByNode[n.Name]; ok {
@@ -121,7 +122,7 @@ func snapshot(r *http.Request, c client.Client) (*State, error) {
 		}
 		s.Nodes = append(s.Nodes, v)
 	}
-	sort.Slice(s.Nodes, func(i, j int) bool { return s.Nodes[i].Name < s.Nodes[j].Name })
+	slices.SortFunc(s.Nodes, func(a, b NodeView) int { return strings.Compare(a.Name, b.Name) })
 
 	for _, e := range events.Items {
 		if e.ReportingController != "node-health-operator" {
@@ -133,7 +134,7 @@ func snapshot(r *http.Request, c client.Client) (*State, error) {
 		}
 		s.Events = append(s.Events, EventView{Time: t, Node: e.Regarding.Name, Type: e.Type, Reason: e.Reason, Note: e.Note})
 	}
-	sort.Slice(s.Events, func(i, j int) bool { return s.Events[i].Time.After(s.Events[j].Time) })
+	slices.SortFunc(s.Events, func(a, b EventView) int { return b.Time.Compare(a.Time) }) // newest first
 	if len(s.Events) > 40 {
 		s.Events = s.Events[:40]
 	}

@@ -138,7 +138,7 @@ func TestSelectToStart(t *testing.T) {
 		return Candidate{Name: name, Health: Health{Unhealthy: true, Since: t0.Add(-time.Duration(ageMin) * time.Minute)}}
 	}
 	names := func(cs []Candidate) []string {
-		out := []string{}
+		out := make([]string, 0, len(cs))
 		for _, x := range cs {
 			out = append(out, x.Name)
 		}
