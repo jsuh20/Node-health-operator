@@ -21,7 +21,8 @@ spec:
     matchLabels:
       control-plane: controller-manager
       app.kubernetes.io/name: node-health-operator
-  replicas: 1
+  # Two replicas: one leader does the work, the other waits to take over.
+  replicas: 2
   template:
     metadata:
       annotations:
@@ -50,6 +51,14 @@ spec:
       #             operator: In
       #             values:
       #               - linux
+      # Run on the control plane, never on the worker nodes the operator
+      # drains. Otherwise it could evict itself mid-remediation.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       securityContext:
         # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
         # This ensures that deployments meet the highest security requirements for Kubernetes.

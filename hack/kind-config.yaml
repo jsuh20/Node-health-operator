@@ -1,0 +1,20 @@
+# Local cluster: 1 control plane + 4 workers in a "gpu" pool.
+# The operator runs on the control-plane node; the policy targets the pool.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Grafana and Prometheus NodePorts, so they open on localhost.
+      - containerPort: 30300
+        hostPort: 3000
+      - containerPort: 30090
+        hostPort: 9090
+  - role: worker
+    labels: {nodehealth.dev/pool: gpu}
+  - role: worker
+    labels: {nodehealth.dev/pool: gpu}
+  - role: worker
+    labels: {nodehealth.dev/pool: gpu}
+  - role: worker
+    labels: {nodehealth.dev/pool: gpu}

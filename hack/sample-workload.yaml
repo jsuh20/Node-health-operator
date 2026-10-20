@@ -1,0 +1,35 @@
+# A workload spread over the GPU pool, protected by a PodDisruptionBudget,
+# so drains have something real to evict. The preStop sleep makes each pod
+# take ~15s to shut down, which gives the "kill the controller mid-drain"
+# chaos test a window to hit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: training-job
+  namespace: default
+spec:
+  replicas: 6
+  selector:
+    matchLabels: {app: training-job}
+  template:
+    metadata:
+      labels: {app: training-job}
+    spec:
+      nodeSelector: {nodehealth.dev/pool: gpu}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: registry.k8s.io/pause:3.10
+          lifecycle:
+            preStop:
+              sleep: {seconds: 15}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: training-job
+  namespace: default
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: training-job}

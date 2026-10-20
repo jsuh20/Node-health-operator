@@ -1,9 +1,24 @@
+# Remediate GPU-pool nodes that are NotReady or report a GPU fault for 60s+.
+# At most 25% of the pool (1 of 4 nodes on the kind cluster) at a time.
 apiVersion: remediation.nodehealth.dev/v1alpha1
 kind: RemediationPolicy
 metadata:
-  labels:
-    app.kubernetes.io/name: node-health-operator
-    app.kubernetes.io/managed-by: kustomize
-  name: remediationpolicy-sample
+  name: gpu-pool
 spec:
-  # TODO(user): Add fields here
+  nodeSelector:
+    matchLabels:
+      nodehealth.dev/pool: gpu
+  unhealthyConditions:
+    - {type: Ready, status: "False"}
+    - {type: Ready, status: Unknown}
+    - {type: GPUHealthy, status: "False"}
+  unhealthyDuration: 60s
+  maxConcurrent: "25%"
+  strategy: Reboot
+  drainTimeout: 2m
+  rebootTimeout: 3m
+  retry:
+    maxAttempts: 3
+    initialBackoff: 30s
+    maxBackoff: 5m
+  dryRun: false

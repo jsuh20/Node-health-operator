@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= node-health-operator:dev
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -61,38 +61,7 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
-
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# kubectl kuberc is disabled by default for test isolation; enable with:
-# - KUBECTL_KUBERC=true
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= node-health-operator-test-e2e
-
-.PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
-	esac
-
-.PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
-
-.PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test ./... -coverprofile cover.out
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -176,6 +145,62 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+
+##@ Local cluster (kind)
+
+KIND_CLUSTER ?= nodehealth
+FAKE_INFRA ?= http://localhost:8090
+
+.PHONY: kind-up
+kind-up: ## Create the 5-node kind cluster (1 control plane + 4 GPU-pool workers).
+	@$(KIND) get clusters | grep -qx $(KIND_CLUSTER) || $(KIND) create cluster --name $(KIND_CLUSTER) --config hack/kind-config.yaml
+	$(KUBECTL) config use-context kind-$(KIND_CLUSTER)
+
+.PHONY: kind-down
+kind-down: ## Delete the kind cluster.
+	$(KIND) delete cluster --name $(KIND_CLUSTER)
+
+.PHONY: kind-deploy
+kind-deploy: docker-build ## Build the image, load it into kind, deploy the operator.
+	$(KIND) load docker-image $(IMG) --name $(KIND_CLUSTER)
+	$(MAKE) deploy IMG=$(IMG)
+	$(KUBECTL) -n node-health-operator-system rollout restart deploy/node-health-operator-controller-manager
+	$(KUBECTL) -n node-health-operator-system rollout status deploy/node-health-operator-controller-manager --timeout=180s
+
+.PHONY: sample
+sample: ## Apply the sample RemediationPolicy and a PDB-protected workload.
+	$(KUBECTL) apply -f config/samples/remediation_v1alpha1_remediationpolicy.yaml
+	$(KUBECTL) apply -f hack/sample-workload.yaml
+
+.PHONY: observability
+observability: ## Install Prometheus (localhost:9090) and Grafana with the dashboard (localhost:3000).
+	$(KUBECTL) apply -f hack/observability/prometheus.yaml
+	$(KUBECTL) -n monitoring create configmap grafana-dashboards --from-file=dashboards/node-health.json \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) apply -f hack/observability/grafana.yaml
+
+.PHONY: run-fake-infra
+run-fake-infra: ## Run the fault injector / fake reboot provider + web dashboard (localhost:8090).
+	go run ./cmd/fake-infra
+
+.PHONY: break
+break: ## Inject a fault: make break NODE=nodehealth-worker2 [TYPE=gpu|notready] [STICKY=true]
+	@test -n "$(NODE)" || { echo "usage: make break NODE=<node> [TYPE=gpu|notready] [STICKY=true]"; exit 1; }
+	curl -fsS -X POST "$(FAKE_INFRA)/api/nodes/$(NODE)/fault?type=$(or $(TYPE),gpu)&sticky=$(or $(STICKY),false)"; echo
+
+.PHONY: heal
+heal: ## Clear faults on a node: make heal NODE=nodehealth-worker2
+	@test -n "$(NODE)" || { echo "usage: make heal NODE=<node>"; exit 1; }
+	curl -fsS -X DELETE "$(FAKE_INFRA)/api/nodes/$(NODE)/fault"; echo
+
+.PHONY: watch
+watch: ## Watch nodes and policy status.
+	watch -n1 '$(KUBECTL) get nodes -L nodehealth.dev/pool; echo; $(KUBECTL) get remediationpolicies'
+
+.PHONY: chaos
+chaos: ## Run all chaos scenarios against the kind cluster (needs fake-infra running).
+	hack/chaos/run-all.sh
+
 
 ##@ Dependencies
 
